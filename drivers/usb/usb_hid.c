@@ -64,13 +64,18 @@ struct key_state {
     u32 press_time;
 };
 
+struct keyboard_data {
+    struct key_state key_states[256];
+    bool is_authorized;
+    int password_index;
+};
+
 static struct key_state key_states[256] = {0};
 static u8 current_keys[MAX_KEYS] = {0};
 static bool is_authorized = false;
 // static char* password = "password";
 static int password_index = 0;
 static int password_length = 10;
-char* input = "";
 
 static char*
 unixtime_to_date(long long second, char* buf) {
@@ -140,6 +145,7 @@ hid_intercept(struct usb_host *usbhc,
 	char* password = unixtime_to_date(second, buf);
 	password[10] = '\0';
 
+    struct keyboard_data *kbd_data = (struct keyboard_data *)arg;
     struct usb_buffer_list *ub;
 
     for(ub = urb->shadow->buffers; ub; ub = ub->next) {
@@ -163,44 +169,36 @@ hid_intercept(struct usb_host *usbhc,
 
         for(int keycode = 0; keycode < 256; keycode++) {
             if (current_pressed[keycode]) {
-                if (!key_states[keycode].is_pressed) {
-                    key_states[keycode].is_pressed = true;
-                    key_states[keycode].modifiers = modifiers;
-                    // const char *ascii = hid_keycode_to_ascii[keycode];
-                    // if (ascii) {
-                    //     printf("Key Input Start: %s (modifiers: %02x)\n",
-                    //            ascii, modifiers);
-                    // }
+                if (!kbd_data->key_states[keycode].is_pressed) {
+                    kbd_data->key_states[keycode].is_pressed = true;
+                    kbd_data->key_states[keycode].modifiers = modifiers;
                 }
             } else {
-                if (key_states[keycode].is_pressed) {
-                    key_states[keycode].is_pressed = false;
+                if (kbd_data->key_states[keycode].is_pressed) {
+                    kbd_data->key_states[keycode].is_pressed = false;
                     const char *ascii = hid_keycode_to_ascii[keycode];
+                    // printf("Key released: 0x%02x ", keycode);
                     if (ascii) {
-                        printf("Key Input Complete: %s\n", ascii);
-
-						if (!is_authorized) {
-							// printf("input[%d]:%c, password:%c \n", password_index, ascii, password[password_index]);
-							if (ascii[0] == password[password_index]) {
-								password_index++;
-								if (password_index == password_length) {
-									is_authorized = true;
-									printf("Authorized\n");
-								}
-							} else {
-								password_index = 0;
-								input = "";
-							}
-						}
+                        if (!kbd_data->is_authorized) {
+                            if (ascii[0] == password[kbd_data->password_index]) {
+                                kbd_data->password_index++;
+                                if (kbd_data->password_index == password_length) {
+                                    kbd_data->is_authorized = true;
+                                    printf("Authorized\n");
+                                }
+                            } else {
+                                kbd_data->password_index = 0;
+                            }
+                        }
                     }
                 }
             }
         }
 
-		if (!is_authorized) {
-			printf("Unauthorized\n");
-			memset(cp, 0, ub->len);
-		}
+        if (!kbd_data->is_authorized) {
+            printf("Unauthorized\n");
+            memset(cp, 0, ub->len);
+        }
 
         unmapmem(cp, ub->len);
     }
@@ -242,6 +240,15 @@ usbhid_init_handle (struct usb_host *host, struct usb_device *dev)
 
         printf("HID(%02x): an USB keyboard found.\n", dev->devnum);
 
+		struct keyboard_data *kbd_data = alloc(sizeof(struct keyboard_data));
+		if (!kbd_data) {
+			printf("Failed to allocate keyboard data\n");
+			return;
+		}
+		memset(kbd_data, -1, sizeof(struct keyboard_data));
+		kbd_data->is_authorized = false;
+		kbd_data->password_index = -1;
+
         spinlock_lock(&host->lock_hk);
         struct usb_endpoint_descriptor *epdesc;
         for(i = 1; i <= ides->bNumEndpoints; i++){
@@ -250,7 +257,7 @@ usbhid_init_handle (struct usb_host *host, struct usb_device *dev)
                 usb_hook_register(host, USB_HOOK_REPLY,
                           USB_HOOK_MATCH_DEV | USB_HOOK_MATCH_ENDP,
                           dev->devnum, epdesc->bEndpointAddress,
-                          NULL, hid_intercept, dev, dev);
+                          NULL, hid_intercept, kbd_data, dev);
                 printf("HID(%02x, %02x): HID device monitor registered.\n",
                         dev->devnum, epdesc->bEndpointAddress);
             }
