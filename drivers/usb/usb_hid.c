@@ -38,6 +38,10 @@
 #define USB_ICLASS_HID  0x3
 #define USB_PROTOCOL_KEYBOARD  0x1
 #define MAX_KEYS 6
+#define RECORD_START_MOD 0x03  // Ctrl(0x01) + Shift(0x02)
+#define RECORD_START_KEY 0x3B  // F2
+#define RECORD_STOP_MOD  0x03  // Ctrl + Shift
+#define RECORD_STOP_KEY  0x3C  // F3
 
 static const char *hid_keycode_to_ascii[256] = {
     [0x04] = "a", [0x05] = "b", [0x06] = "c", [0x07] = "d", [0x08] = "e",
@@ -58,6 +62,10 @@ const char *keycode_to_ascii(u8 keycode) {
     return hid_keycode_to_ascii[keycode];
 }
 
+static u8 modifiers;
+static u32 press_time;
+static long long last_key_up_time = 0;  // 最後にキーが離された時刻
+
 struct key_state {
     bool is_pressed;
     u8 modifiers;
@@ -68,6 +76,9 @@ struct keyboard_data {
     struct key_state key_states[256];
     bool is_authorized;
     int password_index;
+    bool is_recording;
+    int sample_count;
+    long long session_start_time;
 };
 
 static struct key_state key_states[256] = {0};
@@ -76,6 +87,22 @@ static bool is_authorized = false;
 // static char* password = "password";
 static int password_index = 0;
 static int password_length = 10;
+
+static void start_recording(struct keyboard_data *kbd_data, long long current_time_us) {
+    if (!kbd_data->is_recording) {
+        kbd_data->is_recording = true;
+        kbd_data->session_start_time = current_time_us;
+        printf("Recording started at time: %lld\n", current_time_us);
+		printf("EVENT,KEY,TIMESTAMP,TIMING\n");
+    }
+}
+
+static void stop_recording(struct keyboard_data *kbd_data) {
+    if (kbd_data->is_recording) {
+        kbd_data->is_recording = false;
+        printf("Recording stopped. Total samples: %d\n", kbd_data->sample_count);
+    }
+}
 
 static char*
 unixtime_to_date(long long second, char* buf) {
@@ -141,6 +168,8 @@ hid_intercept(struct usb_host *usbhc,
 	long long second;
 	int microsecond;
 	get_epoch_time(&second, &microsecond);
+	long long current_time_us = second * 1000000LL + microsecond;
+
 	char buf[10];
 	char* password = unixtime_to_date(second, buf);
 	password[10] = '\0';
@@ -169,36 +198,75 @@ hid_intercept(struct usb_host *usbhc,
 
         for(int keycode = 0; keycode < 256; keycode++) {
             if (current_pressed[keycode]) {
-                if (!kbd_data->key_states[keycode].is_pressed) {
-                    kbd_data->key_states[keycode].is_pressed = true;
-                    kbd_data->key_states[keycode].modifiers = modifiers;
-                }
-            } else {
-                if (kbd_data->key_states[keycode].is_pressed) {
+				if (!kbd_data->key_states[keycode].is_pressed) {
+					kbd_data->key_states[keycode].is_pressed = true;
+					kbd_data->key_states[keycode].modifiers = modifiers;
+					kbd_data->key_states[keycode].press_time = current_time_us;
+
+					// Flight Time計算 (前のキーが離されてから今のキーが押されるまでの時間)
+					long long flight_time = (last_key_up_time > 0) ? (current_time_us - last_key_up_time) : 0;
+
+					if (kbd_data->is_recording) {
+						kbd_data->sample_count++;
+						printf("DOWN,KEY=0x%02x(%s),TIME=%lld,FLIGHT=%lld\n",
+							keycode,
+							hid_keycode_to_ascii[keycode] ? hid_keycode_to_ascii[keycode] : "?",
+							current_time_us,
+							flight_time);
+					}
+
+
+					// 録画開始コマンドの検出
+					if ((modifiers & RECORD_START_MOD) == RECORD_START_MOD &&
+						keycode == RECORD_START_KEY) {
+						start_recording(kbd_data, current_time_us);
+						continue;
+					}
+
+					// 録画停止コマンドの検出
+					if ((modifiers & RECORD_STOP_MOD) == RECORD_STOP_MOD &&
+						keycode == RECORD_STOP_KEY) {
+						stop_recording(kbd_data);
+						continue;
+					}
+				}
+			} else {
+				if (kbd_data->key_states[keycode].is_pressed) {
+					// Hold Time計算 (キーが押されてから離されるまでの時間)
+					long long hold_time = current_time_us - kbd_data->key_states[keycode].press_time;
+					last_key_up_time = current_time_us;
+
+					if (kbd_data->is_recording) {
+						printf("UP,KEY=0x%02x(%s),TIME=%lld,HOLD=%lld\n",
+							keycode,
+							hid_keycode_to_ascii[keycode] ? hid_keycode_to_ascii[keycode] : "?",
+							current_time_us,
+							hold_time);
+					}
+
                     kbd_data->key_states[keycode].is_pressed = false;
-                    const char *ascii = hid_keycode_to_ascii[keycode];
-                    // printf("Key released: 0x%02x ", keycode);
-                    if (ascii) {
-                        if (!kbd_data->is_authorized) {
-                            if (ascii[0] == password[kbd_data->password_index]) {
-                                kbd_data->password_index++;
-                                if (kbd_data->password_index == password_length) {
-                                    kbd_data->is_authorized = true;
-                                    printf("Authorized\n");
-                                }
-                            } else {
-                                kbd_data->password_index = 0;
-                            }
-                        }
-                    }
-                }
-            }
+                    // const char *ascii = hid_keycode_to_ascii[keycode];
+                    // if (ascii) {
+                    //     if (!kbd_data->is_authorized) {
+                    //         if (ascii[0] == password[kbd_data->password_index]) {
+                    //             kbd_data->password_index++;
+                    //             if (kbd_data->password_index == password_length) {
+                    //                 kbd_data->is_authorized = true;
+                    //                 printf("Authorized\n");
+                    //             }
+                    //         } else {
+                    //             kbd_data->password_index = 0;
+                    //         }
+                    //     }
+                    // }
+				}
+			}
         }
 
-        if (!kbd_data->is_authorized) {
-            printf("Unauthorized\n");
-            memset(cp, 0, ub->len);
-        }
+        // if (!kbd_data->is_authorized) {
+        //     printf("Unauthorized\n");
+        //     memset(cp, 0, ub->len);
+        // }
 
         unmapmem(cp, ub->len);
     }
@@ -247,7 +315,17 @@ usbhid_init_handle (struct usb_host *host, struct usb_device *dev)
 		}
 		memset(kbd_data, -1, sizeof(struct keyboard_data));
 		kbd_data->is_authorized = false;
-		kbd_data->password_index = -1;
+		kbd_data->password_index = 0;
+		kbd_data->is_recording = false;
+		kbd_data->sample_count = 0;
+		kbd_data->session_start_time = 0;
+
+		// key_statesの初期化
+		for (int i = 0; i < 256; i++) {
+			kbd_data->key_states[i].is_pressed = false;
+			kbd_data->key_states[i].modifiers = 0;
+			kbd_data->key_states[i].press_time = 0;
+		}
 
         spinlock_lock(&host->lock_hk);
         struct usb_endpoint_descriptor *epdesc;
