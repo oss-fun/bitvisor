@@ -34,3 +34,4 @@ compile_commands.json
 *.efi
 *.lib
 *.exe
+*.csv
