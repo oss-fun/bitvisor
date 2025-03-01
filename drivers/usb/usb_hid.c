@@ -34,6 +34,7 @@
 #include "usb_hook.h"
 #include "usb_log.h"
 #include <core/time.h>
+#include "keystroke.h"
 
 #define USB_ICLASS_HID  0x3
 #define USB_PROTOCOL_KEYBOARD  0x1
@@ -42,6 +43,14 @@
 #define RECORD_START_KEY 0x3B  // F2
 #define RECORD_STOP_MOD  0x03  // Ctrl + Shift
 #define RECORD_STOP_KEY  0x3C  // F3
+
+// Keystroke dynamics parameters
+#define FEATURE_COUNT 30        // Number of keystroke features to track
+#define MIN_KEYSTROKE_COUNT 10  // Minimum keystrokes before authentication
+#define CONFIDENCE_THRESHOLD 750 // Authentication threshold (75.0% * 1000)
+
+// Fixed point scaling (10^3 = 1000)
+#define FIXED_POINT_SCALE 1000
 
 static const char *hid_keycode_to_ascii[256] = {
     [0x04] = "a", [0x05] = "b", [0x06] = "c", [0x07] = "d", [0x08] = "e",
@@ -87,6 +96,157 @@ static bool is_authorized = false;
 // static char* password = "password";
 static int password_index = 0;
 static int password_length = 10;
+
+// Keystroke feature structure
+struct keystroke_feature {
+    u8 keycode;
+    long long press_time;
+    long long release_time;
+    long long hold_time;
+    long long flight_time;
+};
+
+// Recent keystroke features for authentication
+static struct keystroke_feature recent_keystrokes[FEATURE_COUNT] = {0};
+static int keystroke_index = 0;
+static int input_features[FEATURE_COUNT] = {0};
+static long long last_key_up_time = 0;
+
+// Feature statistics for normalization
+static struct {
+    int hold_time_mean;
+    int hold_time_std;
+    int flight_time_mean;
+    int flight_time_std;
+    bool initialized;
+} feature_stats = {
+    .hold_time_mean = 100,  // 100ms average hold time
+    .hold_time_std = 50,    // 50ms standard deviation
+    .flight_time_mean = 150, // 150ms average flight time
+    .flight_time_std = 80,   // 80ms standard deviation
+    .initialized = true
+};
+
+// Normalize a feature value using z-score normalization (integer math)
+static int normalize_feature(int value, int mean, int std_dev) {
+    if (std_dev == 0) return 0;
+    return ((value - mean) * FIXED_POINT_SCALE) / std_dev;
+}
+
+// Prepare input features for the model
+static void prepare_features_for_model() {
+    // Reset input features
+    memset(input_features, 0, sizeof(input_features));
+
+    int index = 0;
+
+    // Process hold times (first half of features)
+    for (int i = 0; i < keystroke_index && i < FEATURE_COUNT/2; i++) {
+        if (index < FEATURE_COUNT) {
+            // Normalize hold time and store it
+            input_features[index++] = normalize_feature(
+                (int)recent_keystrokes[i].hold_time,
+                feature_stats.hold_time_mean,
+                feature_stats.hold_time_std
+            );
+        }
+    }
+
+    // Process flight times (second half of features)
+    for (int i = 1; i < keystroke_index && i < FEATURE_COUNT/2; i++) {
+        if (index < FEATURE_COUNT) {
+            // Normalize flight time and store it
+            input_features[index++] = normalize_feature(
+                (int)recent_keystrokes[i].flight_time,
+                feature_stats.flight_time_mean,
+                feature_stats.flight_time_std
+            );
+        }
+    }
+
+    // Pad remaining features with zeros if we don't have enough keystrokes
+    while (index < FEATURE_COUNT) {
+        input_features[index++] = 0;
+    }
+}
+
+// Calculate confidence score using the model
+static int calculate_confidence_score() {
+    // Prepare features for the model
+    prepare_features_for_model();
+
+    // Call model inference function from keystroke.h
+    int confidence = keystroke_predict(input_features, FEATURE_COUNT);
+
+    // Debug output
+    printf("Model inference result: %d\n", confidence);
+
+    return confidence;
+}
+
+// Check if the keystroke pattern matches the authorized user
+static bool verify_keystroke_pattern() {
+    if (keystroke_index < MIN_KEYSTROKE_COUNT) {
+        printf("Not enough keystrokes for authentication (%d/%d)\n",
+               keystroke_index, MIN_KEYSTROKE_COUNT);
+        return false;
+    }
+
+    int confidence = calculate_confidence_score();
+    bool authenticated = confidence > CONFIDENCE_THRESHOLD;
+
+    printf("Authentication result: %s (confidence: %d.%d, threshold: %d.%d)\n",
+           authenticated ? "AUTHENTICATED" : "REJECTED",
+           confidence / FIXED_POINT_SCALE,
+           (confidence % FIXED_POINT_SCALE) / (FIXED_POINT_SCALE / 100),
+           CONFIDENCE_THRESHOLD / FIXED_POINT_SCALE,
+           (CONFIDENCE_THRESHOLD % FIXED_POINT_SCALE) / (FIXED_POINT_SCALE / 100));
+
+    return authenticated;
+}
+
+// Update the keystroke timing database with a new keystroke
+static void add_keystroke_feature(struct keyboard_data *kbd_data, u8 keycode,
+                                 long long press_time, long long release_time) {
+    // Shift features if buffer is full
+    if (keystroke_index >= FEATURE_COUNT) {
+        // Move all elements one position left
+        for (int i = 0; i < FEATURE_COUNT - 1; i++) {
+            recent_keystrokes[i] = recent_keystrokes[i + 1];
+        }
+        keystroke_index = FEATURE_COUNT - 1;
+    }
+
+    // Add new keystroke data
+    recent_keystrokes[keystroke_index].keycode = keycode;
+    recent_keystrokes[keystroke_index].press_time = press_time;
+    recent_keystrokes[keystroke_index].release_time = release_time;
+    recent_keystrokes[keystroke_index].hold_time = release_time - press_time;
+
+    // Calculate flight time if not the first keystroke
+    if (keystroke_index > 0) {
+        recent_keystrokes[keystroke_index].flight_time =
+            press_time - recent_keystrokes[keystroke_index - 1].release_time;
+    } else {
+        recent_keystrokes[keystroke_index].flight_time = 0;
+    }
+
+    // Debug output
+    printf("Added keystroke: key=%d, hold=%lldms, flight=%lldms\n",
+           keycode, recent_keystrokes[keystroke_index].hold_time,
+           recent_keystrokes[keystroke_index].flight_time);
+
+    keystroke_index++;
+
+    // Try authentication when enough keystrokes are collected
+    if (keystroke_index >= MIN_KEYSTROKE_COUNT && !kbd_data->is_authorized) {
+        bool is_authenticated = verify_keystroke_pattern();
+        if (is_authenticated) {
+            kbd_data->is_authorized = true;
+            printf("User authenticated by keystroke dynamics!\n");
+        }
+    }
+}
 
 static void start_recording(struct keyboard_data *kbd_data, long long current_time_us) {
     if (!kbd_data->is_recording) {
@@ -243,6 +403,13 @@ hid_intercept(struct usb_host *usbhc,
 							current_time_us,
 							hold_time);
 					}
+                    // Add to keystroke features for authentication
+                    add_keystroke_feature(
+                        kbd_data,
+                        keycode,
+                        kbd_data->key_states[keycode].press_time,
+                        current_time_us
+                    );
 
                     kbd_data->key_states[keycode].is_pressed = false;
                     // const char *ascii = hid_keycode_to_ascii[keycode];
@@ -325,6 +492,13 @@ usbhid_init_handle (struct usb_host *host, struct usb_device *dev)
 			kbd_data->key_states[i].is_pressed = false;
 			kbd_data->key_states[i].modifiers = 0;
 			kbd_data->key_states[i].press_time = 0;
+		}
+
+		// Initialize the keystroke dynamics model
+		if (!keystroke_init()) {
+			printf("Failed to initialize keystroke dynamics model\n");
+		} else {
+			printf("Keystroke dynamics model initialized successfully\n");
 		}
 
         spinlock_lock(&host->lock_hk);
